@@ -317,8 +317,6 @@ async def auto_repost_loop(bot):
                 last_repost = get_setting(slot_key, "")
 
                 if matched and last_repost != today_str:
-
-                if matched and last_repost != today_str:
                         logger.info(f"[autorepost] Time slot fired! {now.hour:02d}:{now.minute:02d}")
 
                         # Each time slot gets its own channel from the rotation
