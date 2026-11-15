@@ -576,36 +576,78 @@ async def cmd_remove_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ ትክክለኛ ቁጥር ያስፍሩ።")
 
 
+def parse_user_time(t: str) -> str:
+    """
+    Parse time in 12-hour (8:00PM, 8PM, 8:30am) or 24-hour (20:00) format.
+    Returns UTC time string HH:MM (subtracts 3 hours for Addis Ababa UTC+3).
+    Raises ValueError on bad input.
+    """
+    import re
+    t = t.strip().upper().replace(" ", "")
+    m = re.match(r'^(\d{1,2})(?::(\d{2}))?(AM|PM)?$', t)
+    if not m:
+        raise ValueError(f"Invalid time: {t}")
+    hour   = int(m.group(1))
+    minute = int(m.group(2)) if m.group(2) else 0
+    ampm   = m.group(3)
+
+    if ampm == "PM" and hour != 12:
+        hour += 12
+    elif ampm == "AM" and hour == 12:
+        hour = 0
+    elif ampm is None:
+        # 24-hour format — accept as-is
+        pass
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"Out of range: {t}")
+
+    # Convert Addis (UTC+3) → UTC
+    utc_hour = (hour - 3) % 24
+    return f"{utc_hour:02d}:{minute:02d}"
+
+
+def utc_to_addis(t: str) -> str:
+    """Convert UTC HH:MM back to Addis AM/PM for display."""
+    hour, minute = map(int, t.split(":"))
+    addis_hour = (hour + 3) % 24
+    ampm = "AM" if addis_hour < 12 else "PM"
+    display_hour = addis_hour % 12 or 12
+    return f"{display_hour}:{minute:02d} {ampm}"
+
+
 async def cmd_set_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     if not ctx.args:
-        times = get_setting("repost_times", "20:00").split(",")
-        times_str = "\n".join(f"  • {t}" for t in times)
+        times = get_setting("repost_times", "17:00").split(",")
+        times_str = "\n".join(f"  • {utc_to_addis(t)} (Addis)" for t in times)
         await update.message.reply_text(
-            f"🕐 የቀጠሮ ሰዓቶች:\n{times_str}\n\n"
-            f"ለመቀየር: `/settime 09:00 14:00 20:00`",
+            f"🕐 የቀጠሮ ሰዓቶች (Addis time):\n{times_str}\n\n"
+            f"ለመቀየር: `/settime 9AM 2PM 8PM`",
             parse_mode="Markdown"
         )
         return
 
-    valid = []
+    valid_utc   = []
+    valid_addis = []
     for t in ctx.args:
         try:
-            hour, minute = map(int, t.strip().split(":"))
-            assert 0 <= hour <= 23 and 0 <= minute <= 59
-            valid.append(f"{hour:02d}:{minute:02d}")
+            utc = parse_user_time(t)
+            valid_utc.append(utc)
+            valid_addis.append(utc_to_addis(utc))
         except Exception:
             await update.message.reply_text(
-                f"❌ `{t}` ትክክል አይደለም። ቅርጸት: `HH:MM` (ለምሳሌ: `20:00`)",
+                f"❌ `{t}` ትክክል አይደለም።\n"
+                f"ምሳሌ: `9AM` `2:30PM` `8PM`",
                 parse_mode="Markdown"
             )
             return
 
-    set_setting("repost_times", ",".join(valid))
-    times_str = "\n".join(f"  • {t}" for t in valid)
+    set_setting("repost_times", ",".join(valid_utc))
+    times_str = "\n".join(f"  • {a}" for a in valid_addis)
     await update.message.reply_text(
-        f"✅ ሰዓቶች ተቀናብረዋል! ({len(valid)} ጊዜ ዕለት ዕለት)\n\n{times_str}",
+        f"✅ ሰዓቶች ተቀናብረዋል! ({len(valid_utc)} ጊዜ ዕለት ዕለት — Addis time)\n\n{times_str}",
         parse_mode="Markdown"
     )
 
@@ -643,12 +685,12 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     enabled      = get_setting("autorepost", "off")
-    repost_times = get_setting("repost_times", "20:00").split(",")
+    repost_times = get_setting("repost_times", "17:00").split(",")
     channels     = get_source_channels()
 
     status_icon = "🟢" if enabled == "on" else "🔴"
     ch_lines    = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(channels)) if channels else "  ምንም የለም"
-    time_lines  = "  " + ", ".join(repost_times)
+    time_lines  = "  " + ", ".join(utc_to_addis(t) for t in repost_times)
     await update.message.reply_text(
         f"📊 Bot Status\n\n"
         f"{status_icon} Auto-repost: {enabled.upper()}\n"
