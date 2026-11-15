@@ -63,6 +63,10 @@ DATABASE_URL          = os.environ["DATABASE_URL"]
 YOUTUBE_CLIENT_SECRET = os.environ.get("YOUTUBE_CLIENT_SECRET", "./client_secret.json")
 YOUTUBE_TOKEN_FILE    = os.environ.get("YOUTUBE_TOKEN_FILE", "./token.json")
 
+# Your personal Telegram account ID (for bridge communication)
+# The bot sends "DOWNLOAD:<url>" to this account to trigger yt_downloader_bridge.py
+PERSONAL_TG_ID = int(os.environ.get("PERSONAL_TG_ID", "0"))
+
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
 # Conversation states
@@ -419,20 +423,37 @@ async def receive_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def receive_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle YouTube URL sent as a message."""
+    """Handle YouTube URL — trigger bridge to download via Gozilla_bot."""
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
 
     url = update.message.text.strip()
-    ctx.user_data["source_url"] = url
-    ctx.user_data["file_id"] = None
 
-    await update.message.reply_text(
-        f"✅ YouTube URL ተቀብሏል!\n\n"
-        f"🔗 {url}\n\n"
-        f"📝 የቪዲዮውን ርዕስ ያስፍሩ (ወይም ✅ ለዋናው ርዕስ ይጠቀሙ):"
-    )
-    return WAIT_TITLE
+    if PERSONAL_TG_ID:
+        # Trigger the Telethon bridge to download via Gozilla_bot
+        await update.message.reply_text(
+            f"🔗 URL ተቀብሏል!\n\n"
+            f"⬇️ @Gozilla_bot በኩል እያወረደ ነው...\n\n"
+            f"ቪዲዮው ሲደርስ እዚሁ ይላካል። ርዕስና ሰዓት ለማዘጋጀት ቪዲዮውን ይጠብቁ።"
+        )
+        # Send download request to personal account (bridge picks it up)
+        await update.get_bot().send_message(
+            PERSONAL_TG_ID,
+            f"DOWNLOAD:{url}"
+        )
+        # Store URL for reference
+        ctx.user_data["pending_url"] = url
+        return ConversationHandler.END
+    else:
+        # Fallback: store URL directly (old behavior)
+        ctx.user_data["source_url"] = url
+        ctx.user_data["file_id"] = None
+        await update.message.reply_text(
+            f"✅ YouTube URL ተቀብሏል!\n\n"
+            f"🔗 {url}\n\n"
+            f"📝 የቪዲዮውን ርዕስ ያስፍሩ:"
+        )
+        return WAIT_TITLE
 
 
 async def receive_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
