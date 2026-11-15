@@ -302,23 +302,37 @@ async def auto_repost_loop(bot):
 
             if enabled == "on" and channels:
                 now = datetime.now()
-                try:
-                    hour, minute = map(int, repost_time.split(":"))
-                except Exception:
-                    hour, minute = 20, 0
-
+                repost_times = get_setting("repost_times", "20:00").split(",")
                 now_hm = (now.hour, now.minute)
-                if now_hm == (hour, minute):
-                    today_str   = now.strftime("%Y-%m-%d")
-                    last_repost = get_setting("last_autorepost_date", "")
 
-                    if last_repost != today_str:
-                        logger.info(f"[autorepost] Time to repost! {len(channels)} channels")
+                # Check if current time matches any scheduled time
+                matched = any(
+                    now_hm == tuple(map(int, t.strip().split(":")))
+                    for t in repost_times if ":" in t
+                )
 
-                        # Pick next channel by rotating (index stored in settings)
-                        last_idx = int(get_setting("last_channel_idx", "-1"))
-                        next_idx = (last_idx + 1) % len(channels)
-                        source   = channels[next_idx]
+                # Use time-slot key so each slot fires independently
+                slot_key = f"last_repost_{now.hour:02d}{now.minute:02d}"
+                today_str   = now.strftime("%Y-%m-%d")
+                last_repost = get_setting(slot_key, "")
+
+                if matched and last_repost != today_str:
+
+                if matched and last_repost != today_str:
+                        logger.info(f"[autorepost] Time slot fired! {now.hour:02d}:{now.minute:02d}")
+
+                        # Each time slot gets its own channel from the rotation
+                        # slot index = which position this time is in the times list
+                        repost_times_list = [t.strip() for t in repost_times if ":" in t]
+                        now_str  = f"{now.hour:02d}:{now.minute:02d}"
+                        try:
+                            slot_idx = repost_times_list.index(now_str)
+                        except ValueError:
+                            slot_idx = 0
+
+                        # Pick channel by slot index (wraps around if fewer channels than times)
+                        ch_idx = slot_idx % len(channels)
+                        source = channels[ch_idx]
 
                         try:
                             video_url, title = await get_channel_latest_video(source)
@@ -330,34 +344,34 @@ async def auto_repost_loop(bot):
                                 ).fetchone()
 
                             if existing:
-                                # Try next channel
-                                logger.info(f"[autorepost] Already reposted from {source}, trying next")
-                                next_idx = (next_idx + 1) % len(channels)
-                                source   = channels[next_idx]
-                                video_url, title = await get_channel_latest_video(source)
-
-                            with get_conn() as conn:
-                                conn.execute(
-                                    "INSERT INTO scheduled_videos (source_url, title, scheduled_at) VALUES (%s, %s, NOW())",
-                                    (video_url, title)
+                                logger.info(f"[autorepost] Already reposted {video_url}, skipping")
+                                await bot.send_message(
+                                    ADMIN_ID,
+                                    f"ℹ️ Slot {slot_idx+1} ({now_str}): {source} — አዲስ ቪዲዮ የለም፣ ተዘሏል።"
                                 )
-                                conn.commit()
+                            else:
+                                with get_conn() as conn:
+                                    conn.execute(
+                                        "INSERT INTO scheduled_videos (source_url, title, scheduled_at) VALUES (%s, %s, NOW())",
+                                        (video_url, title)
+                                    )
+                                    conn.commit()
 
-                            set_setting("last_autorepost_date", today_str)
-                            set_setting("last_channel_idx", str(next_idx))
+                                set_setting(slot_key, today_str)
 
-                            await bot.send_message(
-                                ADMIN_ID,
-                                f"🔄 Auto-repost ተጀምሯል!\n\n"
-                                f"📡 ምንጭ: {source}\n"
-                                f"📹 {title}\n\n"
-                                f"ቦቱ አሁን ያወርደዋል እና ይለቅቃል..."
-                            )
-                            logger.info(f"[autorepost] Scheduled from channel {next_idx+1}: {title}")
+                                await bot.send_message(
+                                    ADMIN_ID,
+                                    f"🔄 Auto-repost ተጀምሯል!\n\n"
+                                    f"🕐 ሰዓት: {now_str} (slot {slot_idx+1})\n"
+                                    f"📡 Channel {ch_idx+1}: {source}\n"
+                                    f"📹 {title}\n\n"
+                                    f"ቦቱ አሁን ያወርደዋል እና ይለቅቃል..."
+                                )
+                                logger.info(f"[autorepost] Slot {slot_idx+1} → Channel {ch_idx+1}: {title}")
 
                         except Exception as e:
                             logger.error(f"[autorepost] Error: {e}")
-                            await bot.send_message(ADMIN_ID, f"❌ Auto-repost ስህተት:\n{e}")
+                            await bot.send_message(ADMIN_ID, f"❌ Auto-repost ስህተት (slot {slot_idx+1}):\n{e}")
 
         except Exception as e:
             logger.error(f"[autorepost] Loop error: {e}")
@@ -566,20 +580,34 @@ async def cmd_set_time(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     if not ctx.args:
+        times = get_setting("repost_times", "20:00").split(",")
+        times_str = "\n".join(f"  • {t}" for t in times)
         await update.message.reply_text(
-            "❌ ሰዓት ያስፍሩ:\n`/settime 20:00`",
+            f"🕐 የቀጠሮ ሰዓቶች:\n{times_str}\n\n"
+            f"ለመቀየር: `/settime 09:00 14:00 20:00`",
             parse_mode="Markdown"
         )
         return
-    t = ctx.args[0].strip()
-    try:
-        hour, minute = map(int, t.split(":"))
-        assert 0 <= hour <= 23 and 0 <= minute <= 59
-    except Exception:
-        await update.message.reply_text("❌ ቅርጸት ትክክል አይደለም። ለምሳሌ: `/settime 20:00`", parse_mode="Markdown")
-        return
-    set_setting("repost_time", t)
-    await update.message.reply_text(f"✅ የቀጠሮ ሰዓት ተቀናብሯል: {t} ቦ.ሠ. ዕለት ዕለት")
+
+    valid = []
+    for t in ctx.args:
+        try:
+            hour, minute = map(int, t.strip().split(":"))
+            assert 0 <= hour <= 23 and 0 <= minute <= 59
+            valid.append(f"{hour:02d}:{minute:02d}")
+        except Exception:
+            await update.message.reply_text(
+                f"❌ `{t}` ትክክል አይደለም። ቅርጸት: `HH:MM` (ለምሳሌ: `20:00`)",
+                parse_mode="Markdown"
+            )
+            return
+
+    set_setting("repost_times", ",".join(valid))
+    times_str = "\n".join(f"  • {t}" for t in valid)
+    await update.message.reply_text(
+        f"✅ ሰዓቶች ተቀናብረዋል! ({len(valid)} ጊዜ ዕለት ዕለት)\n\n{times_str}",
+        parse_mode="Markdown"
+    )
 
 
 async def cmd_autorepost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -614,18 +642,17 @@ async def cmd_autorepost(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    enabled     = get_setting("autorepost", "off")
-    repost_time = get_setting("repost_time", "20:00")
-    last        = get_setting("last_autorepost_date", "ገና አልተለቀቀም")
-    channels    = get_source_channels()
+    enabled      = get_setting("autorepost", "off")
+    repost_times = get_setting("repost_times", "20:00").split(",")
+    channels     = get_source_channels()
 
     status_icon = "🟢" if enabled == "on" else "🔴"
-    ch_lines = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(channels)) if channels else "  ምንም የለም"
+    ch_lines    = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(channels)) if channels else "  ምንም የለም"
+    time_lines  = "  " + ", ".join(repost_times)
     await update.message.reply_text(
         f"📊 Bot Status\n\n"
         f"{status_icon} Auto-repost: {enabled.upper()}\n"
-        f"🕐 ሰዓት: {repost_time} ዕለት ዕለት\n"
-        f"📅 ላለፈው repost: {last}\n\n"
+        f"🕐 ሰዓቶች: {time_lines}\n\n"
         f"📡 Source channels ({len(channels)}):\n{ch_lines}"
     )
 
@@ -663,6 +690,20 @@ async def self_ping_loop():
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+async def set_bot_commands(app):
+    await app.bot.set_my_commands([
+        ("start",         "📹 Bot ይጀምሩ / እርዳታ"),
+        ("status",        "📊 የ auto-repost ሁኔታ"),
+        ("list",          "📋 የቀጠሮ ዝርዝር"),
+        ("setsource",     "📡 Source channel ጨምሩ"),
+        ("removesource",  "🗑 Source channel አስወግዱ"),
+        ("settime",       "🕐 የቀጠሮ ሰዓቶች ቀናብሩ"),
+        ("autorepost",    "🔄 Auto-repost on/off"),
+        ("cancel",        "❌ አሁን ያለውን ይቅር"),
+    ])
+    logger.info("[bot] Commands menu set ✅")
+
+
 async def run():
     init_db()
     await start_web_server()
@@ -696,6 +737,7 @@ async def run():
 
     async with tg_app:
         await tg_app.start()
+        await set_bot_commands(tg_app)
         await tg_app.updater.start_polling(allowed_updates=["message"])
         asyncio.create_task(scheduler_loop(tg_app.bot))
         asyncio.create_task(auto_repost_loop(tg_app.bot))
