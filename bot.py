@@ -32,7 +32,9 @@ import asyncio
 import json
 import os
 import logging
+import re
 import tempfile
+import xml.etree.ElementTree as ET
 import subprocess
 import aiohttp
 from aiohttp import web
@@ -42,7 +44,7 @@ from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
-    ContextTypes, filters
+    ContextTypes, ApplicationHandlerStop, filters
 )
 
 from google.oauth2.credentials import Credentials
@@ -66,6 +68,8 @@ YOUTUBE_TOKEN_FILE    = os.environ.get("YOUTUBE_TOKEN_FILE", "./token.json")
 # Your personal Telegram account ID (for bridge communication)
 # The bot sends "DOWNLOAD:<url>" to this account to trigger yt_downloader_bridge.py
 PERSONAL_TG_ID = int(os.environ.get("PERSONAL_TG_ID", "0"))
+
+DOWNLOAD_WAIT_SECONDS = int(os.environ.get("DOWNLOAD_WAIT_SECONDS", "1200"))
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
@@ -95,6 +99,9 @@ def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        conn.execute(
+            "ALTER TABLE scheduled_videos ADD COLUMN IF NOT EXISTS dl_requested_at TIMESTAMP"
+        )
         conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_settings (
                 key TEXT PRIMARY KEY,
@@ -168,8 +175,61 @@ async def download_youtube_video(url: str, output_path: str) -> str:
     return await loop.run_in_executor(None, _download)
 
 
+_UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Cookie": "CONSENT=YES+1; SOCS=CAI",
+}
+
+
+async def _get_channel_id(session: aiohttp.ClientSession, channel_url: str) -> str:
+    m = re.search(r"/channel/(UC[\w-]{22})", channel_url)
+    if m:
+        return m.group(1)
+    cached = get_setting(f"chid:{channel_url}", "")
+    if cached:
+        return cached
+    async with session.get(channel_url, headers=_UA) as r:
+        html = await r.text()
+    m = (re.search(r'"channelId":"(UC[\w-]{22})"', html)
+         or re.search(r'"externalId":"(UC[\w-]{22})"', html)
+         or re.search(r'channel_id=(UC[\w-]{22})', html))
+    if not m:
+        raise RuntimeError("Could not resolve channel id (use a /channel/UC... URL)")
+    set_setting(f"chid:{channel_url}", m.group(1))
+    return m.group(1)
+
+
+async def get_channel_latest_video_rss(channel_url: str) -> tuple[str, str]:
+    """Latest video via YouTube's public RSS feed (not blocked like yt-dlp)."""
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        cid = await _get_channel_id(session, channel_url)
+        async with session.get(
+            f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}", headers=_UA
+        ) as r:
+            if r.status != 200:
+                raise RuntimeError(f"RSS feed HTTP {r.status}")
+            xml = await r.text()
+    ns = {"a": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
+    entry = ET.fromstring(xml).find("a:entry", ns)
+    if entry is None:
+        raise RuntimeError("No videos found in RSS feed")
+    vid = entry.find("yt:videoId", ns).text
+    title = entry.find("a:title", ns).text or "Untitled"
+    return f"https://www.youtube.com/watch?v={vid}", title
+
+
 async def get_channel_latest_video(channel_url: str) -> tuple[str, str]:
-    """Get the latest video URL and title from a YouTube channel."""
+    try:
+        return await get_channel_latest_video_rss(channel_url)
+    except Exception as e:
+        logger.warning(f"[channel] RSS failed ({e}), falling back to yt-dlp")
+        return await _get_channel_latest_video_ytdlp(channel_url)
+
+
+async def _get_channel_latest_video_ytdlp(channel_url: str) -> tuple[str, str]:
+    """Get the latest video URL and title from a YouTube channel (yt-dlp)."""
     loop = asyncio.get_event_loop()
 
     def _fetch():
@@ -233,26 +293,53 @@ async def scheduler_loop(bot):
         try:
             with get_conn() as conn:
                 rows = conn.execute("""
-                    SELECT id, file_id, source_url, title, description
+                    SELECT id, file_id, source_url, title, description,
+                           dl_requested_at IS NOT NULL,
+                           COALESCE(EXTRACT(EPOCH FROM (NOW() - dl_requested_at)), 0)
                     FROM scheduled_videos
                     WHERE posted = FALSE AND scheduled_at <= NOW()
                     ORDER BY scheduled_at ASC
                 """).fetchall()
 
-            for row_id, file_id, source_url, title, description in rows:
+            for row_id, file_id, source_url, title, description, dl_requested, dl_age in rows:
+                # URL-based video: let the Telethon bridge download it via Gozilla_bot
+                if source_url and not file_id and PERSONAL_TG_ID:
+                    if not dl_requested:
+                        await bot.send_message(PERSONAL_TG_ID, f"DOWNLOAD:{source_url}|{row_id}")
+                        with get_conn() as conn:
+                            conn.execute(
+                                "UPDATE scheduled_videos SET dl_requested_at=NOW() WHERE id=%s",
+                                (row_id,),
+                            )
+                            conn.commit()
+                        logger.info(f"[scheduler] Bridge download requested id={row_id}")
+                        continue
+                    if dl_age < DOWNLOAD_WAIT_SECONDS:
+                        continue  # still waiting for the bridge
+                    with get_conn() as conn:
+                        conn.execute(
+                            "UPDATE scheduled_videos SET posted=TRUE, youtube_id=%s WHERE id=%s",
+                            ("ERROR: bridge download timed out", row_id),
+                        )
+                        conn.commit()
+                    await bot.send_message(
+                        ADMIN_ID, f"❌ Bridge download timed out:\n{title}\n{source_url}"
+                    )
+                    continue
+
                 logger.info(f"[scheduler] Processing video id={row_id} title={title}")
                 tmp_path = None
                 try:
                     tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp4")
                     os.close(tmp_fd)
 
-                    if source_url:
-                        # Download from YouTube URL
-                        await download_youtube_video(source_url, tmp_path)
-                    elif file_id:
-                        # Download from Telegram file
+                    if file_id:
+                        # Download from Telegram file (also used for bridge downloads)
                         file = await bot.get_file(file_id)
                         await file.download_to_drive(tmp_path)
+                    elif source_url:
+                        # Fallback: yt-dlp (often blocked on cloud IPs)
+                        await download_youtube_video(source_url, tmp_path)
                     else:
                         raise RuntimeError("No file_id or source_url")
 
@@ -454,6 +541,22 @@ async def receive_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📝 የቪዲዮውን ርዕስ ያስፍሩ:"
         )
         return WAIT_TITLE
+
+
+async def receive_bridge_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Video sent back by the Telethon bridge, captioned 'ROW:<id>'."""
+    msg = update.message
+    m = re.match(r"ROW:(\d+)", msg.caption or "")
+    media = msg.video or msg.document
+    if m and media:
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE scheduled_videos SET file_id=%s WHERE id=%s AND posted=FALSE",
+                (media.file_id, int(m.group(1))),
+            )
+            conn.commit()
+        logger.info(f"[bridge] Video received for row {m.group(1)}")
+    raise ApplicationHandlerStop  # don't start the manual upload conversation
 
 
 async def receive_title(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -787,6 +890,16 @@ async def run():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    if PERSONAL_TG_ID:
+        tg_app.add_handler(
+            MessageHandler(
+                filters.User(PERSONAL_TG_ID)
+                & (filters.VIDEO | filters.Document.ALL)
+                & filters.CaptionRegex(r"^ROW:\d+"),
+                receive_bridge_video,
+            ),
+            group=-1,
+        )
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("list", list_scheduled))
     tg_app.add_handler(CommandHandler("status", cmd_status))
