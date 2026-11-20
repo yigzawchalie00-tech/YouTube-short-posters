@@ -33,6 +33,7 @@ import json
 import os
 import logging
 import re
+import random
 import tempfile
 import xml.etree.ElementTree as ET
 import subprocess
@@ -255,6 +256,77 @@ async def _get_channel_latest_video_ytdlp(channel_url: str) -> tuple[str, str]:
     return await loop.run_in_executor(None, _fetch)
 
 
+CHANNEL_TAB = os.environ.get("CHANNEL_TAB", "videos")  # videos | shorts | streams
+
+
+async def list_channel_videos_rss(channel_url: str) -> list[tuple[str, str]]:
+    """Up to ~15 latest videos from the public RSS feed (not blocked)."""
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        cid = await _get_channel_id(session, channel_url)
+        async with session.get(
+            f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}", headers=_UA
+        ) as r:
+            if r.status != 200:
+                raise RuntimeError(f"RSS feed HTTP {r.status}")
+            xml = await r.text()
+    ns = {"a": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
+    out = []
+    for entry in ET.fromstring(xml).findall("a:entry", ns):
+        vid = entry.find("yt:videoId", ns).text
+        title = entry.find("a:title", ns).text or "Untitled"
+        out.append((f"https://www.youtube.com/watch?v={vid}", title))
+    return out
+
+
+async def list_channel_videos_ytdlp(channel_url: str, limit: int = 200) -> list[tuple[str, str]]:
+    """Whole channel (up to `limit`) via yt-dlp --flat-playlist."""
+    url = channel_url.split("?")[0].rstrip("/")
+    if not re.search(r"/(videos|shorts|streams|playlist)$", url):
+        url = f"{url}/{CHANNEL_TAB}"
+    loop = asyncio.get_event_loop()
+
+    def _fetch():
+        cmd = ["yt-dlp", "--flat-playlist", "--playlist-end", str(limit),
+               "--print", "%(id)s\t%(title)s", url]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr[-300:])
+        out = []
+        for line in result.stdout.splitlines():
+            parts = line.strip().split("\t", 1)
+            if len(parts) >= 1 and re.fullmatch(r"[\w-]{11}", parts[0]):
+                out.append((f"https://www.youtube.com/watch?v={parts[0]}",
+                            parts[1] if len(parts) > 1 else "Untitled"))
+        return out
+
+    return await loop.run_in_executor(None, _fetch)
+
+
+async def pick_unposted_video(channel_url: str):
+    """
+    Pick a random video from the channel that has never been queued/posted.
+    Returns (url, title, pool_size) or None if everything was already used.
+    """
+    try:
+        videos = await list_channel_videos_ytdlp(channel_url)
+        if not videos:
+            raise RuntimeError("empty list")
+    except Exception as e:
+        logger.warning(f"[autorepost] yt-dlp listing failed ({e}); using RSS (latest ~15 only)")
+        videos = await list_channel_videos_rss(channel_url)
+
+    with get_conn() as conn:
+        used = {r[0] for r in conn.execute(
+            "SELECT source_url FROM scheduled_videos WHERE source_url IS NOT NULL"
+        ).fetchall()}
+    fresh = [v for v in videos if v[0] not in used]
+    if not fresh:
+        return None
+    url, title = random.choice(fresh)
+    return url, title, len(fresh)
+
+
 # ── Upload to YouTube ─────────────────────────────────────────────────────────
 
 async def upload_to_youtube(video_path: str, title: str, description: str = "") -> str:
@@ -424,19 +496,16 @@ async def auto_repost_loop(bot):
                         source = channels[ch_idx]
 
                         try:
-                            video_url, title = await get_channel_latest_video(source)
-
-                            with get_conn() as conn:
-                                existing = conn.execute(
-                                    "SELECT id FROM scheduled_videos WHERE source_url=%s",
-                                    (video_url,)
-                                ).fetchone()
+                            picked = await pick_unposted_video(source)
+                            existing = picked is None
+                            if picked:
+                                video_url, title, pool = picked
 
                             if existing:
-                                logger.info(f"[autorepost] Already reposted {video_url}, skipping")
+                                logger.info(f"[autorepost] No unposted videos left on {source}")
                                 await bot.send_message(
                                     ADMIN_ID,
-                                    f"ℹ️ Slot {slot_idx+1} ({now_str}): {source} — አዲስ ቪዲዮ የለም፣ ተዘሏል።"
+                                    f"ℹ️ Slot {slot_idx+1} ({now_str}): {source} — ያልተለቀቀ ቪዲዮ አልቋል፣ ተዘሏል።"
                                 )
                             else:
                                 with get_conn() as conn:
