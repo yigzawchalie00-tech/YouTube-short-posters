@@ -50,7 +50,7 @@ from telegram.ext import (
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import InstalledAppFlow, Flow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 import psycopg
@@ -133,15 +133,20 @@ def set_setting(key: str, value: str):
 
 def get_youtube_service():
     creds = None
+    token_db = get_setting("youtube_token", "")      # set by /auth (highest priority)
     token_env = os.environ.get("YOUTUBE_TOKEN", "")
-    if token_env.strip().startswith("{"):
+    if token_db.strip().startswith("{"):
+        creds = Credentials.from_authorized_user_info(json.loads(token_db), SCOPES)
+    elif token_env.strip().startswith("{"):
         creds = Credentials.from_authorized_user_info(json.loads(token_env), SCOPES)
     elif os.path.exists(YOUTUBE_TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(YOUTUBE_TOKEN_FILE, SCOPES)
 
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        if token_env.strip().startswith("{"):
+        if token_db.strip().startswith("{"):
+            set_setting("youtube_token", creds.to_json())
+        elif token_env.strip().startswith("{"):
             os.environ["YOUTUBE_TOKEN"] = creds.to_json()
         else:
             with open(YOUTUBE_TOKEN_FILE, "w") as f:
@@ -151,6 +156,63 @@ def get_youtube_service():
         raise RuntimeError("YouTube not authorized.")
 
     return build("youtube", "v3", credentials=creds)
+
+
+# ── YouTube login from the phone (/auth + /authcode) ─────────────────────────
+
+_AUTH_REDIRECT = "http://localhost:8080/"
+_pending_flow = {"flow": None}
+
+
+def _load_client_config() -> dict:
+    raw = YOUTUBE_CLIENT_SECRET.strip()
+    if raw.startswith("{"):
+        return json.loads(raw)
+    with open(raw) as f:
+        return json.load(f)
+
+
+async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        flow = Flow.from_client_config(_load_client_config(), SCOPES, redirect_uri=_AUTH_REDIRECT)
+        url, _ = flow.authorization_url(access_type="offline", prompt="consent")
+        _pending_flow["flow"] = flow
+    except Exception as e:
+        await update.message.reply_text(f"❌ /auth failed: {e}")
+        return
+    await update.message.reply_text(
+        "1️⃣ Open this link and allow access (choose the Google account that owns the channel):\n\n"
+        f"{url}\n\n"
+        "2️⃣ After you allow, the page will say it can't be reached (localhost) — that is normal.\n"
+        "3️⃣ Copy the FULL address from your browser's address bar and send it here as:\n"
+        "/authcode <paste the address>",
+        disable_web_page_preview=True,
+    )
+
+
+async def cmd_authcode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    flow = _pending_flow.get("flow")
+    if flow is None:
+        await update.message.reply_text("Send /auth first.")
+        return
+    text = " ".join(ctx.args).strip() if ctx.args else ""
+    if not text:
+        await update.message.reply_text("Usage: /authcode <the full address from the browser>")
+        return
+    from urllib.parse import urlparse, parse_qs
+    code = parse_qs(urlparse(text).query).get("code", [text])[0]
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: flow.fetch_token(code=code))
+        set_setting("youtube_token", flow.credentials.to_json())
+        _pending_flow["flow"] = None
+        await update.message.reply_text("✅ YouTube connected! New token saved. Uploads will work now.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not get token: {e}\nTry /auth again.")
 
 
 # ── Download from YouTube URL ─────────────────────────────────────────────────
@@ -970,6 +1032,8 @@ async def run():
             group=-1,
         )
     tg_app.add_handler(CommandHandler("start", start))
+    tg_app.add_handler(CommandHandler("auth", cmd_auth))
+    tg_app.add_handler(CommandHandler("authcode", cmd_authcode))
     tg_app.add_handler(CommandHandler("list", list_scheduled))
     tg_app.add_handler(CommandHandler("status", cmd_status))
     tg_app.add_handler(CommandHandler("setsource", cmd_set_source))
