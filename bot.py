@@ -332,7 +332,7 @@ async def _get_channel_latest_video_ytdlp(channel_url: str) -> tuple[str, str]:
     return await loop.run_in_executor(None, _fetch)
 
 
-CHANNEL_TAB = os.environ.get("CHANNEL_TAB", "videos")  # videos | shorts | streams
+CHANNEL_TAB = os.environ.get("CHANNEL_TAB", "shorts")  # shorts (default) | videos | streams
 
 
 async def list_channel_videos_rss(channel_url: str) -> list[tuple[str, str]]:
@@ -379,6 +379,25 @@ async def list_channel_videos_ytdlp(channel_url: str, limit: int = 200) -> list[
     return await loop.run_in_executor(None, _fetch)
 
 
+async def _keep_only_shorts(videos: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """RSS lists every upload; keep only real Shorts (youtube.com/shorts/ID answers 200)."""
+    timeout = aiohttp.ClientTimeout(total=15)
+    keep = []
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for url, title in videos:
+            vid = url.rsplit("=", 1)[-1]
+            try:
+                async with session.head(
+                    f"https://www.youtube.com/shorts/{vid}",
+                    headers=_UA, allow_redirects=False,
+                ) as r:
+                    if r.status == 200:
+                        keep.append((url, title))
+            except Exception:
+                pass
+    return keep
+
+
 async def pick_unposted_video(channel_url: str):
     """
     Pick a random video from the channel that has never been queued/posted.
@@ -391,6 +410,8 @@ async def pick_unposted_video(channel_url: str):
     except Exception as e:
         logger.warning(f"[autorepost] yt-dlp listing failed ({e}); using RSS (latest ~15 only)")
         videos = await list_channel_videos_rss(channel_url)
+        if CHANNEL_TAB == "shorts":
+            videos = await _keep_only_shorts(videos)
 
     with get_conn() as conn:
         used = {r[0] for r in conn.execute(
@@ -568,20 +589,32 @@ async def auto_repost_loop(bot):
                             slot_idx = 0
 
                         # Pick channel by slot index (wraps around if fewer channels than times)
-                        ch_idx = slot_idx % len(channels)
-                        source = channels[ch_idx]
+                        # Rotate through ALL channels across slots/days; if a channel has
+                        # nothing left, move on to the next one.
+                        start = int(get_setting("rotation_next", "0") or 0) % len(channels)
+                        picked, ch_idx, source = None, start, channels[start]
 
                         try:
-                            picked = await pick_unposted_video(source)
+                            for k in range(len(channels)):
+                                ch_idx = (start + k) % len(channels)
+                                source = channels[ch_idx]
+                                try:
+                                    picked = await pick_unposted_video(source)
+                                except Exception as e:
+                                    logger.warning(f"[autorepost] {source} failed: {e}")
+                                    picked = None
+                                if picked:
+                                    break
                             existing = picked is None
                             if picked:
                                 video_url, title, pool = picked
+                                set_setting("rotation_next", str((ch_idx + 1) % len(channels)))
 
                             if existing:
                                 logger.info(f"[autorepost] No unposted videos left on {source}")
                                 await bot.send_message(
                                     ADMIN_ID,
-                                    f"ℹ️ Slot {slot_idx+1} ({now_str}): {source} — ያልተለቀቀ ቪዲዮ አልቋል፣ ተዘሏል።"
+                                    f"ℹ️ Slot {slot_idx+1} ({now_str}): ከ{len(channels)} channels ውስጥ ያልተለቀቀ ቪዲዮ አልተገኘም፣ ተዘሏል።"
                                 )
                             else:
                                 with get_conn() as conn:
