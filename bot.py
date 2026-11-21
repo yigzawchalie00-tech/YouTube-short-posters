@@ -168,8 +168,22 @@ def _load_client_config() -> dict:
     raw = YOUTUBE_CLIENT_SECRET.strip()
     if raw.startswith("{"):
         return json.loads(raw)
-    with open(raw) as f:
-        return json.load(f)
+    if os.path.exists(raw):
+        with open(raw) as f:
+            return json.load(f)
+    # No client_secret.json: reuse the client id/secret stored inside the old token
+    for src in (get_setting("youtube_token", ""), os.environ.get("YOUTUBE_TOKEN", "")):
+        if src.strip().startswith("{"):
+            t = json.loads(src)
+            if t.get("client_id") and t.get("client_secret"):
+                return {"installed": {
+                    "client_id": t["client_id"],
+                    "client_secret": t["client_secret"],
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": t.get("token_uri", "https://oauth2.googleapis.com/token"),
+                    "redirect_uris": ["http://localhost"],
+                }}
+    raise RuntimeError("No client_secret.json found and no client id inside YOUTUBE_TOKEN")
 
 
 async def cmd_auth(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
